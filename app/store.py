@@ -73,6 +73,7 @@ def _recipe_dict(row) -> dict:
         "holdHigh": row["hold_high"],
         "duration": row["duration"],
         "tolerance": row["tolerance"],
+        "status": row["status"],
         "version": row["version"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
@@ -219,6 +220,27 @@ def update_recipe(
         return recipe, drafts
 
 
+def set_recipe_status(recipe_id: int, status: str) -> dict:
+    """停用（disabled）/ 恢复（active）配方，只切换状态本身。
+
+    不改变材料参数，不增加配方或任何草稿的版本，也不重算已有炉次；
+    重复停用 / 恢复为幂等。与新建炉次并发时由全局锁串行化：停用先
+    生效，则引用它的新建因「已停用」以 422 失败。
+    """
+    assert status in ("active", "disabled")  # 路由层只传这两个值
+    with lock(), connect() as conn:
+        with _tx(conn):
+            row = conn.execute(
+                "SELECT id FROM recipes WHERE id=?", (recipe_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"配方 {recipe_id} 不存在。")
+            conn.execute(
+                "UPDATE recipes SET status=? WHERE id=?", (status, recipe_id)
+            )
+        return get_recipe(recipe_id)
+
+
 def _recompute_referencing(conn, recipe_ids: set[int]) -> list[int]:
     """重算引用了给定配方集合的所有**活动**草稿，返回受影响草稿 ID。"""
     rows = conn.execute(
@@ -291,7 +313,10 @@ def get_draft(draft_id: int) -> dict:
 
 
 def create_draft(name: str, recipe_ids: list[int]) -> dict:
-    """按顺序引用 2~3 个不同的现有配方；引用不可改，从 20°C 空记录求解。"""
+    """按顺序引用 2~3 个不同的可用配方；引用不可改，从 20°C 空记录求解。
+
+    引用不存在或已停用的配方 => 422（指明配方 ID），不保存炉次。
+    """
     now = _now()
     with lock(), connect() as conn:
         with _tx(conn):
@@ -306,6 +331,13 @@ def create_draft(name: str, recipe_ids: list[int]) -> dict:
                     f"配方 ID {', '.join(map(str, missing))} 不存在，无法引用。"
                 )
             ordered = [by_id[r] for r in recipe_ids]
+            # 停用配方不可用于新建炉次（不保存草稿）；已有引用不受影响
+            disabled = [r["id"] for r in ordered if r["status"] != "active"]
+            if disabled:
+                raise Unprocessable(
+                    f"配方 ID {', '.join(map(str, disabled))} 已停用，"
+                    "不能用于新建炉次。"
+                )
 
             materials = [_to_material(r) for r in ordered]
             snapshot = [_material_snapshot(r) for r in ordered]

@@ -113,11 +113,23 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 - 支持**创建、读取、整份修改**（PUT 为全量替换）。配方创建时版本为 1，
   每次成功修改版本 +1；**非法修改返回 422，不写入任何数据**（配方版本、
   引用草稿均保持原样）。
+- 每个配方带有**状态**：`active`（可用，默认）/ `disabled`（停用）。
+  新建配方与旧数据库中已有的配方一律为可用；状态保存在 SQLite 中，
+  重启后保留。`GET /api/recipes` 始终列出**全部**配方并附 `status`。
+- **停用 / 恢复**：`POST /api/recipes/{id}/disable`、
+  `POST /api/recipes/{id}/enable`（未知配方返回 404；重复停用 / 恢复
+  幂等返回 200）。状态切换**不改变材料参数、不增加配方或草稿版本、
+  不重算任何炉次**；停用的配方仍可整份修改（保持停用），原有引用草稿
+  照常重算与归档，已归档方案不受影响。恢复后可再次被新炉次引用。
 
 ### 炉次草稿 `/api/drafts`
 
 - 创建时按**顺序**给出 `recipeIds`：必须是 **2～3 个互不相同的现有配方
   ID**；引用一经创建**不可更改**（没有修改引用的接口）。
+- 新建炉次只能引用**可用**状态的配方：引用任一**已停用**配方 → **422**
+  （`detail` 指明配方 ID），**不保存炉次**；前端下拉同样只列出可用配方，
+  页面尚未刷新时由服务端拦截。停用与新建并发时按某一先后顺序串行生效：
+  停用先生效，则新建失败。
 - 创建即**从 20°C 空记录求解**（复用原 BFS 规则），草稿**版本从 1 开始**；
   结果（有解时的完整曲线，或无解时的中文原因）与当时的材料参数快照一同
   保存。**无解草稿同样保存**，只是不保留任何曲线。
@@ -205,12 +217,14 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/recipes` | 列出全部配方 |
-| POST | `/api/recipes` | 创建配方（201，版本从 1 开始） |
-| GET | `/api/recipes/{id}` | 读取单个配方 |
-| PUT | `/api/recipes/{id}` | 整份修改配方；原子重算引用它的活动草稿（版本 +1） |
+| GET | `/api/recipes` | 列出全部配方（含 `status`：`active` / `disabled`） |
+| POST | `/api/recipes` | 创建配方（201，版本从 1 开始，默认可用） |
+| GET | `/api/recipes/{id}` | 读取单个配方（含状态） |
+| PUT | `/api/recipes/{id}` | 整份修改配方；原子重算引用它的活动草稿（版本 +1）；停用配方也可修改并保持停用 |
+| POST | `/api/recipes/{id}/disable` | 停用配方（200；未知 404；不改参数/版本，不重算草稿） |
+| POST | `/api/recipes/{id}/enable` | 恢复配方为可用（200；未知 404） |
 | GET | `/api/drafts` | 列出全部炉次（含状态/参数/版本/结果或无解原因） |
-| POST | `/api/drafts` | 按 2～3 个不同现有配方 ID 创建炉次并从空记录求解（201） |
+| POST | `/api/drafts` | 按 2～3 个不同现有配方 ID 创建炉次并从空记录求解（201；引用已停用配方 422） |
 | GET | `/api/drafts/{id}` | 读取炉次详情（归档后返回冻结快照） |
 | POST | `/api/drafts/{id}/archive` | 携带查看版本归档（过期 409 / 无解 422） |
 
@@ -366,11 +380,11 @@ curl -sS -X POST http://localhost:8000/api/schedule \
 ### 配方与炉次草稿（可直接复制执行）
 
 ```bash
-# 1) 创建两个材料配方（版本均从 1 开始）
+# 1) 创建两个材料配方（版本均从 1 开始，默认可用）
 curl -sS -X POST http://localhost:8000/api/recipes \
   -H 'Content-Type: application/json' \
   -d '{"name":"钢甲","holdLow":60,"holdHigh":100,"duration":10,"tolerance":150}'
-# {"id":1,"name":"钢甲","holdLow":60,...,"version":1,"createdAt":"...","updatedAt":"..."}
+# {"id":1,"name":"钢甲","holdLow":60,...,"status":"active","version":1,"createdAt":"...","updatedAt":"..."}
 
 curl -sS -X POST http://localhost:8000/api/recipes \
   -H 'Content-Type: application/json' \
@@ -428,6 +442,35 @@ curl -sS -X PUT http://localhost:8000/api/recipes/1 \
 **422 且不改变任何数据**：配方版本不增加，引用草稿也不会被重算。
 新参数导致草稿无解时，草稿仍保存：`version` 增加、`solvable:false`、
 `result:null`、`reason` 为中文原因。
+
+### 停用配方 → 拒绝引用 → 恢复
+
+```bash
+# 停用配方 1：只切换状态，材料参数、配方/草稿版本不变，不重算任何炉次
+curl -sS -X POST http://localhost:8000/api/recipes/1/disable
+# {"id":1,"name":"钢甲",...,"status":"disabled","version":2,...}
+
+# 停用期间新建炉次引用它 → 422，指明配方 ID，不保存炉次
+curl -sS -X POST http://localhost:8000/api/drafts \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"十月二炉","recipeIds":[1,2]}'
+# 422：{"detail":"配方 ID 1 已停用，不能用于新建炉次。"}
+
+# GET /api/recipes 仍列出全部配方并附状态
+curl -sS http://localhost:8000/api/recipes
+# [{"id":1,...,"status":"disabled",...},{"id":2,...,"status":"active",...}]
+
+# 恢复为可用，之后可再次被新炉次引用
+curl -sS -X POST http://localhost:8000/api/recipes/1/enable
+# {"id":1,"name":"钢甲",...,"status":"active","version":2,...}
+
+# 未知配方的状态操作 → 404
+curl -sS -X POST http://localhost:8000/api/recipes/999/disable
+# 404：{"detail":"配方 999 不存在。"}
+```
+
+停用不改变已有炉次：引用它的活动草稿在配方修改时照常重算、可正常归档，
+已归档方案保持冻结；停用的配方本身也仍可整份修改（PUT）并保持停用。
 
 ### 归档：携带所查看的版本
 

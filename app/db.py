@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS recipes (
     hold_high   INTEGER NOT NULL,
     duration    INTEGER NOT NULL,
     tolerance   INTEGER NOT NULL,
+    -- 'active' 可用（默认）/ 'disabled' 停用；停用后不可被新炉次引用，
+    -- 已有引用草稿与已归档方案不受影响
+    status      TEXT    NOT NULL DEFAULT 'active',
     version     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
@@ -80,6 +83,16 @@ CREATE TABLE IF NOT EXISTS archives (
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn) -> None:
+    """旧库就地升级：recipes 缺少 status 列时补上，既有配方默认可用。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(recipes)").fetchall()}
+    if "status" not in cols:
+        conn.execute(
+            "ALTER TABLE recipes ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+        )
 
 
 @contextmanager

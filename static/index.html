@@ -98,12 +98,16 @@
 
       <section class="card">
         <h2>已有配方 <span class="hint" id="recipe-count"></span></h2>
+        <p class="executed-hint">
+          「停用」后配方不再可被新炉次引用（不改变参数与版本，已有引用草稿照常重算、归档，
+          已归档方案不受影响）；「恢复」后可再次被新炉次引用。停用的配方仍可整份修改并保持停用。
+        </p>
         <div class="table-wrap">
           <table id="recipes-table">
             <thead>
               <tr>
                 <th>ID</th><th>名称</th><th>保温下限 °C</th><th>保温上限 °C</th>
-                <th>时长 (分钟)</th><th>耐受上限 °C</th><th>版本</th><th>更新时间</th><th>操作</th>
+                <th>时长 (分钟)</th><th>耐受上限 °C</th><th>版本</th><th>状态</th><th>更新时间</th><th>操作</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -118,7 +122,8 @@
       <section class="card">
         <h2>新建炉次草稿</h2>
         <p class="executed-hint">
-          按顺序引用 <b>2～3 个不同的现有配方</b>（引用创建后不可改）。
+          按顺序引用 <b>2～3 个不同的现有配方</b>（引用创建后不可改；
+          仅「可用」状态的配方可被新炉次引用，已停用配方不出现在下拉中）。
           草稿从 20°C 空记录自动求解，版本从 1 开始。
         </p>
         <form id="draft-form" novalidate>

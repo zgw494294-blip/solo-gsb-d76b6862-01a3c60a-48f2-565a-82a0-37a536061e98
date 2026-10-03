@@ -732,7 +732,8 @@ async function loadRecipes() {
   document.getElementById("recipe-count").textContent = `（共 ${recipes.length} 个）`;
   document.getElementById("recipe-empty").hidden = recipes.length !== 0;
   recipes.forEach((r) => {
-    const tr = el("tr", { class: "rrecipe-" + r.id });
+    const disabled = r.status === "disabled";
+    const tr = el("tr", { class: "rrecipe-" + r.id + (disabled ? " row-disabled" : "") });
     tr.appendChild(el("td", { textContent: String(r.id) }));
     tr.appendChild(el("td", { textContent: r.name || "—" }));
     tr.appendChild(el("td", { textContent: String(r.holdLow) }));
@@ -740,16 +741,48 @@ async function loadRecipes() {
     tr.appendChild(el("td", { textContent: String(r.duration) }));
     tr.appendChild(el("td", { textContent: String(r.tolerance) }));
     tr.appendChild(el("td", {}, el("span", { class: "ver-badge", textContent: `v${r.version}` })));
+    tr.appendChild(el("td", {}, el("span", {
+      class: "status-badge " + (disabled ? "status-disabled" : "status-active"),
+      textContent: disabled ? "已停用" : "可用",
+    })));
     tr.appendChild(el("td", { class: "ts", textContent: fmtTime(r.updatedAt) }));
     const editBtn = el("button", {
       class: "btn-secondary btn-small", type: "button", textContent: "整份修改",
     });
     editBtn.addEventListener("click", () => fillRecipeForm(r));
-    tr.appendChild(el("td", {}, editBtn));
+    const toggleBtn = el("button", {
+      class: "btn-secondary btn-small", type: "button",
+      textContent: disabled ? "恢复" : "停用",
+    });
+    toggleBtn.addEventListener("click", () => toggleRecipeStatus(r));
+    tr.appendChild(el("td", {}, el("div", { class: "op-btns" }, editBtn, toggleBtn)));
     tbody.appendChild(tr);
   });
   // 同步炉次草稿页的引用下拉
   populateDraftRefs(recipes);
+}
+
+// 停用 / 恢复配方：只切换状态，不动参数与版本，也不重算任何炉次
+async function toggleRecipeStatus(r) {
+  const disabled = r.status === "disabled";
+  recipeError.hidden = true;
+  recipeMsg.hidden = true;
+  try {
+    const { ok, data } = await api(`/api/recipes/${r.id}/${disabled ? "enable" : "disable"}`, { method: "POST" });
+    if (!ok) {
+      recipeError.textContent = detailOf(data);
+      recipeError.hidden = false;
+      return;
+    }
+    recipeMsg.textContent = disabled
+      ? `配方 ${r.id} 已恢复为可用，可再次被新炉次引用。`
+      : `配方 ${r.id} 已停用：新建炉次不能再引用它；已有引用草稿不受影响，仍可重算与归档。`;
+    recipeMsg.hidden = false;
+    await loadRecipes();
+  } catch (e) {
+    recipeError.textContent = "无法连接后端服务，请确认服务已启动。";
+    recipeError.hidden = false;
+  }
 }
 
 function fillRecipeForm(r) {
@@ -840,17 +873,20 @@ function populateDraftRefs(recipes) {
 function buildDraftRefRows() {
   const n = Number(draftCountSel.value);
   const prev = Array.from(draftRefsBox.querySelectorAll("select")).map((s) => s.value);
+  // 新建炉次只允许引用「可用」配方；已停用配方不出现在下拉中
+  const available = cachedRecipes.filter((r) => r.status !== "disabled");
   draftRefsBox.innerHTML = "";
   for (let i = 0; i < n; i++) {
     const sel = el("select", { attrs: { "data-ref": String(i) } });
     sel.appendChild(el("option", { value: "", textContent: "选择配方…" }));
-    cachedRecipes.forEach((r) => {
+    available.forEach((r) => {
       sel.appendChild(el("option", {
         value: String(r.id),
         textContent: `#${r.id} ${r.name || "（未命名）"} [${r.holdLow}-${r.holdHigh}°C, ${r.duration}min, 耐受${r.tolerance}°C, v${r.version}]`,
       }));
     });
-    if (prev[i]) sel.value = prev[i];
+    // 之前选中的配方若已被停用（或删除），选择一并清除
+    if (prev[i] && available.some((r) => String(r.id) === prev[i])) sel.value = prev[i];
     const row = el("div", { class: "ref-row" },
       el("span", { class: "ref-order", textContent: `第 ${i + 1} 个配方` }), sel);
     draftRefsBox.appendChild(row);
@@ -871,6 +907,18 @@ draftForm.addEventListener("submit", async (ev) => {
     name: document.getElementById("draft-name").value.trim(),
     recipeIds: ids.map(Number),
   };
+  // 前端先按已知的配方状态拦截；若页面缓存滞后（他处刚停用），
+  // 服务端仍会返回 422 并在下方展示，不会保存炉次
+  const byId = new Map(cachedRecipes.map((r) => [r.id, r]));
+  const disabledIds = payload.recipeIds.filter((id) => {
+    const r = byId.get(id);
+    return r && r.status === "disabled";
+  });
+  if (disabledIds.length) {
+    draftError.textContent = `配方 ID ${disabledIds.join(", ")} 已停用，不能用于新建炉次。`;
+    draftError.hidden = false;
+    return;
+  }
   const btn = document.getElementById("draft-create-btn");
   btn.disabled = true;
   try {
@@ -904,7 +952,8 @@ async function loadDrafts() {
     tr.appendChild(el("td", {
       textContent: d.recipeIds.map((id) => {
         const r = recipesById.get(id);
-        return `#${id}${r && r.name ? " " + r.name : ""}`;
+        const label = `#${id}${r && r.name ? " " + r.name : ""}`;
+        return r && r.status === "disabled" ? `${label}（已停用）` : label;
       }).join(" → "),
     }));
     tr.appendChild(el("td", {}, el("span", { class: "ver-badge", textContent: `v${d.version}` })));
