@@ -241,6 +241,24 @@ def update_recipe(recipe_id: int, payload: RecipeIn):
     return {"recipe": recipe, "recomputedDrafts": drafts}
 
 
+@app.post("/api/recipes/{recipe_id}/deactivate", status_code=200)
+def deactivate_recipe(recipe_id: int):
+    # 停用只切换状态：不动材料参数、版本与任何草稿/归档
+    try:
+        return store.set_recipe_status(recipe_id, False)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.post("/api/recipes/{recipe_id}/activate", status_code=200)
+def activate_recipe(recipe_id: int):
+    # 恢复后可再次被新炉次引用
+    try:
+        return store.set_recipe_status(recipe_id, True)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
 # ---------------- 炉次草稿 ----------------
 
 

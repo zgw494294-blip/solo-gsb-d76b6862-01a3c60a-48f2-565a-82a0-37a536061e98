@@ -113,6 +113,21 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 - 支持**创建、读取、整份修改**（PUT 为全量替换）。配方创建时版本为 1，
   每次成功修改版本 +1；**非法修改返回 422，不写入任何数据**（配方版本、
   引用草稿均保持原样）。
+- 每个配方带**可用状态** `active`（新建配方与旧数据库中的配方默认均为
+  **可用**，状态存于现有 SQLite，重启保留）：
+  - `POST /api/recipes/{id}/deactivate` **停用**：不再用于新炉次；
+  - `POST /api/recipes/{id}/activate` **恢复**：可再次被新炉次引用；
+  - 未知配方的停用 / 恢复返回 **404**；停用一个已停用（或恢复一个已可用）
+    配方是幂等的，返回该配方当前状态。
+  - `GET /api/recipes` 始终列出**全部**配方并附 `active` 状态；新建炉次的
+    下拉只允许选择可用项。
+  - **状态切换只改 `active` 标记**：不改变任何材料参数，不增加配方或草稿
+    版本、不更新 `updatedAt`，不重算已有炉次，已归档方案不受影响。
+  - 停用中的配方**仍可整份修改**（PUT），修改后保持停用，引用它的活动
+    草稿照常重算与归档；原有引用草稿、续炉与归档合同均不变。
+  - `POST /api/drafts` 引用任一停用配方时返回 **422**（中文说明并列出
+    配方 ID），**不保存炉次**；停用与新建并发时由服务端按某一先后顺序
+    串行生效——停用在先则新建失败。
 
 ### 炉次草稿 `/api/drafts`
 
@@ -205,12 +220,14 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/recipes` | 列出全部配方 |
-| POST | `/api/recipes` | 创建配方（201，版本从 1 开始） |
+| GET | `/api/recipes` | 列出全部配方（含 `active` 可用状态） |
+| POST | `/api/recipes` | 创建配方（201，版本从 1 开始，默认可用） |
 | GET | `/api/recipes/{id}` | 读取单个配方 |
-| PUT | `/api/recipes/{id}` | 整份修改配方；原子重算引用它的活动草稿（版本 +1） |
+| PUT | `/api/recipes/{id}` | 整份修改配方；原子重算引用它的活动草稿（版本 +1）；停用配方可改且保持停用 |
+| POST | `/api/recipes/{id}/deactivate` | 停用配方（不影响参数/版本/已有炉次；未知 ID 返回 404） |
+| POST | `/api/recipes/{id}/activate` | 恢复配方为可用（可再次被新炉次引用；未知 ID 返回 404） |
 | GET | `/api/drafts` | 列出全部炉次（含状态/参数/版本/结果或无解原因） |
-| POST | `/api/drafts` | 按 2～3 个不同现有配方 ID 创建炉次并从空记录求解（201） |
+| POST | `/api/drafts` | 按 2～3 个不同**可用**配方 ID 创建炉次并从空记录求解（201；引用停用配方 422） |
 | GET | `/api/drafts/{id}` | 读取炉次详情（归档后返回冻结快照） |
 | POST | `/api/drafts/{id}/archive` | 携带查看版本归档（过期 409 / 无解 422） |
 
@@ -428,6 +445,50 @@ curl -sS -X PUT http://localhost:8000/api/recipes/1 \
 **422 且不改变任何数据**：配方版本不增加，引用草稿也不会被重算。
 新参数导致草稿无解时，草稿仍保存：`version` 增加、`solvable:false`、
 `result:null`、`reason` 为中文原因。
+
+### 停用配方：新炉次不可再引用
+
+```bash
+# 停用配方 1（幂等：对已停用配方再调一次仍返回 200 与当前状态）
+curl -sS -X POST http://localhost:8000/api/recipes/1/deactivate
+# 200：
+# {"id":1,"name":"钢甲","holdLow":60,"holdHigh":100,"duration":10,
+#  "tolerance":150,"version":1,"active":false,
+#  "createdAt":"...","updatedAt":"..."}
+
+# GET 列表仍包含该配方，但 active=false（版本与 updatedAt 均未变化）
+curl -sS http://localhost:8000/api/recipes
+# [{"id":1,...,"version":1,"active":false,...},
+#  {"id":2,...,"version":1,"active":true,...}]
+
+# 新建炉次引用停用配方 → 422，炉次不保存（页面未刷新时同样会被前端拦截）
+curl -sS -X POST http://localhost:8000/api/drafts \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"误引停用","recipeIds":[1,2]}'
+# 422：
+# {"detail":"配方 ID 1 已停用，不能用于新建炉次；请恢复后再引用。"}
+
+# 对未知配方做状态操作 → 404
+curl -sS -X POST http://localhost:8000/api/recipes/99/deactivate
+# 404：{"detail":"配方 99 不存在。"}
+```
+
+停用只切换状态：材料参数、配方与草稿 `version`、`updatedAt` 均不变，
+引用它的活动草稿照常按配方修改重算与归档，已归档方案完全不受影响；
+停用中的配方仍可 `PUT` 整份修改，保存后**保持停用**。
+
+### 恢复配方：可再次被新炉次引用
+
+```bash
+curl -sS -X POST http://localhost:8000/api/recipes/1/activate
+# 200：
+# {"id":1,...,"version":1,"active":true,"updatedAt":"...（与停用前相同）"}
+
+# 恢复后再次创建引用同一配方的炉次即正常返回 201
+curl -sS -X POST http://localhost:8000/api/drafts \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"恢复后首炉","recipeIds":[1,2]}'
+```
 
 ### 归档：携带所查看的版本
 

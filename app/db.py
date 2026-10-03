@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS recipes (
     duration    INTEGER NOT NULL,
     tolerance   INTEGER NOT NULL,
     version     INTEGER NOT NULL DEFAULT 1,
+    -- 是否可用于新建炉次：1=可用，0=已停用；新旧配方默认 1
+    active      INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
 );
@@ -80,6 +82,19 @@ CREATE TABLE IF NOT EXISTS archives (
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn) -> None:
+    """对旧版本数据库做最小化原地升级。
+
+    recipes.active 为后加列：旧库的配方默认全部可用（active=1）。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(recipes)").fetchall()}
+    if "active" not in cols:
+        conn.execute(
+            "ALTER TABLE recipes ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 @contextmanager

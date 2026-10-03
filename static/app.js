@@ -673,6 +673,9 @@ function resetRecipeForm() {
   recipeFormTitle.textContent = "新建材料配方";
   recipeError.hidden = true;
   recipeMsg.hidden = true;
+  const statusHint = document.getElementById("recipe-edit-status");
+  statusHint.hidden = true;
+  statusHint.textContent = "";
 }
 
 recipeCancelBtn.addEventListener("click", resetRecipeForm);
@@ -722,6 +725,9 @@ function resetRecipeFormKeepMsg() {
   recipeCancelBtn.hidden = true;
   recipeFormTitle.textContent = "新建材料配方";
   recipeError.hidden = true;
+  const statusHint = document.getElementById("recipe-edit-status");
+  statusHint.hidden = true;
+  statusHint.textContent = "";
 }
 
 async function loadRecipes() {
@@ -732,7 +738,10 @@ async function loadRecipes() {
   document.getElementById("recipe-count").textContent = `（共 ${recipes.length} 个）`;
   document.getElementById("recipe-empty").hidden = recipes.length !== 0;
   recipes.forEach((r) => {
-    const tr = el("tr", { class: "rrecipe-" + r.id });
+    const active = r.active !== false;
+    const tr = el("tr", {
+      class: ("rrecipe-" + r.id) + (active ? "" : " row-inactive"),
+    });
     tr.appendChild(el("td", { textContent: String(r.id) }));
     tr.appendChild(el("td", { textContent: r.name || "—" }));
     tr.appendChild(el("td", { textContent: String(r.holdLow) }));
@@ -740,16 +749,65 @@ async function loadRecipes() {
     tr.appendChild(el("td", { textContent: String(r.duration) }));
     tr.appendChild(el("td", { textContent: String(r.tolerance) }));
     tr.appendChild(el("td", {}, el("span", { class: "ver-badge", textContent: `v${r.version}` })));
+    tr.appendChild(el("td", {}, el("span", {
+      class: "status-badge " + (active ? "status-active" : "status-inactive"),
+      textContent: active ? "可用" : "已停用",
+    })));
     tr.appendChild(el("td", { class: "ts", textContent: fmtTime(r.updatedAt) }));
+    const ops = el("td", { class: "ops-cell" });
     const editBtn = el("button", {
       class: "btn-secondary btn-small", type: "button", textContent: "整份修改",
     });
     editBtn.addEventListener("click", () => fillRecipeForm(r));
-    tr.appendChild(el("td", {}, editBtn));
+    ops.appendChild(editBtn);
+    const toggleBtn = el("button", {
+      class: "btn-secondary btn-small",
+      type: "button",
+      textContent: active ? "停用" : "恢复",
+    });
+    toggleBtn.addEventListener("click", () => toggleRecipeStatus(r, toggleBtn));
+    ops.appendChild(toggleBtn);
+    tr.appendChild(ops);
     tbody.appendChild(tr);
   });
   // 同步炉次草稿页的引用下拉
   populateDraftRefs(recipes);
+}
+
+// 停用 / 恢复：只切换状态，不改参数、不增版本、不重算已有炉次。
+// 停用为防误操作先确认；成功后重新拉取配方列表（新建炉次下拉随之同步）。
+async function toggleRecipeStatus(r, btn) {
+  const active = r.active !== false;
+  if (active) {
+    const ok = window.confirm(
+      `确定停用配方 #${r.id}${r.name ? "（" + r.name + "）" : ""} 吗？\n\n` +
+      "停用后不能再被新炉次引用（新建炉次下拉中不再显示，直接引用会被服务端拒绝）；" +
+      "已引用它的炉次草稿与已归档方案不受影响，配方仍可整份修改。之后可随时恢复。"
+    );
+    if (!ok) return;
+  }
+  btn.disabled = true;
+  try {
+    const path = `/api/recipes/${r.id}/${active ? "deactivate" : "activate"}`;
+    const { ok, data } = await api(path, { method: "POST" });
+    if (!ok) {
+      recipeError.textContent = detailOf(data);
+      recipeError.hidden = false;
+      recipeMsg.hidden = true;
+      return;
+    }
+    recipeMsg.textContent = active
+      ? `配方 ${r.id} 已停用：不能再用于新建炉次；已有炉次草稿与归档不受影响，可随时恢复。`
+      : `配方 ${r.id} 已恢复为可用，可再次被新炉次引用。`;
+    recipeMsg.hidden = false;
+    recipeError.hidden = true;
+    await loadRecipes();
+  } catch (e) {
+    recipeError.textContent = "无法连接后端服务，请确认服务已启动。";
+    recipeError.hidden = false;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function fillRecipeForm(r) {
@@ -761,6 +819,17 @@ function fillRecipeForm(r) {
   recipeFormTitle.textContent = `整份修改配方 #${r.id}`;
   recipeError.hidden = true;
   recipeMsg.hidden = true;
+  const statusHint = document.getElementById("recipe-edit-status");
+  if (r.active === false) {
+    // 停用配方仍可整份修改，保存后保持停用状态
+    statusHint.textContent =
+      `配方 #${r.id} 当前为「已停用」：仍可整份修改，保存后保持停用；` +
+      "参数改动会照常重算引用它的活动炉次草稿。需要恢复请点列表中的「恢复」。";
+    statusHint.hidden = false;
+  } else {
+    statusHint.hidden = true;
+    statusHint.textContent = "";
+  }
   if (recipeForm.scrollIntoView) recipeForm.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -841,16 +910,21 @@ function buildDraftRefRows() {
   const n = Number(draftCountSel.value);
   const prev = Array.from(draftRefsBox.querySelectorAll("select")).map((s) => s.value);
   draftRefsBox.innerHTML = "";
+  // 新建炉次只允许选择「可用」配方；停用配方不在下拉中出现。
+  const activeRecipes = cachedRecipes.filter((r) => r.active !== false);
   for (let i = 0; i < n; i++) {
     const sel = el("select", { attrs: { "data-ref": String(i) } });
     sel.appendChild(el("option", { value: "", textContent: "选择配方…" }));
-    cachedRecipes.forEach((r) => {
+    activeRecipes.forEach((r) => {
       sel.appendChild(el("option", {
         value: String(r.id),
         textContent: `#${r.id} ${r.name || "（未命名）"} [${r.holdLow}-${r.holdHigh}°C, ${r.duration}min, 耐受${r.tolerance}°C, v${r.version}]`,
       }));
     });
-    if (prev[i]) sel.value = prev[i];
+    // 先前选中的配方在此期间被停用（从下拉移除）时，回落到“请选择”并给出提示
+    if (prev[i] && activeRecipes.some((r) => String(r.id) === prev[i])) {
+      sel.value = prev[i];
+    }
     const row = el("div", { class: "ref-row" },
       el("span", { class: "ref-order", textContent: `第 ${i + 1} 个配方` }), sel);
     draftRefsBox.appendChild(row);
@@ -871,6 +945,22 @@ draftForm.addEventListener("submit", async (ev) => {
     name: document.getElementById("draft-name").value.trim(),
     recipeIds: ids.map(Number),
   };
+  // 页面尚未刷新时的本地拦截：若选中的配方已在本页缓存中被停用，
+  // 不发请求直接拒绝（服务端仍会再次校验，返回 422 且不保存炉次）。
+  const stopped = payload.recipeIds.filter(
+    (id) => {
+      const r = cachedRecipes.find((x) => x.id === id);
+      return r && r.active === false;
+    }
+  );
+  if (stopped.length) {
+    draftError.textContent =
+      `配方 ID ${stopped.join(", ")} 已停用，不能用于新建炉次；` +
+      "请在「材料配方」页恢复后再创建，或改选其他可用配方。";
+    draftError.hidden = false;
+    buildDraftRefRows();
+    return;
+  }
   const btn = document.getElementById("draft-create-btn");
   btn.disabled = true;
   try {

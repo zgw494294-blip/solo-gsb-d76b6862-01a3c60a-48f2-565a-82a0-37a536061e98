@@ -74,6 +74,7 @@ def _recipe_dict(row) -> dict:
         "duration": row["duration"],
         "tolerance": row["tolerance"],
         "version": row["version"],
+        "active": bool(row["active"]),
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -219,6 +220,27 @@ def update_recipe(
         return recipe, drafts
 
 
+def set_recipe_status(recipe_id: int, active: bool) -> dict:
+    """停用 / 恢复配方。
+
+    只切换 active 标记：不改任何材料参数，不增加配方版本与 updated_at，
+    不重算任何草稿，已归档方案自然不受影响。停用中的配方仍可被整份修改，
+    修改后保持原停用状态。不存在的配方抛 NotFound（HTTP 404）。
+    """
+    with lock(), connect() as conn:
+        with _tx(conn):
+            row = conn.execute(
+                "SELECT id FROM recipes WHERE id=?", (recipe_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"配方 {recipe_id} 不存在。")
+            conn.execute(
+                "UPDATE recipes SET active=? WHERE id=?",
+                (1 if active else 0, recipe_id),
+            )
+        return get_recipe(recipe_id)
+
+
 def _recompute_referencing(conn, recipe_ids: set[int]) -> list[int]:
     """重算引用了给定配方集合的所有**活动**草稿，返回受影响草稿 ID。"""
     rows = conn.execute(
@@ -291,7 +313,12 @@ def get_draft(draft_id: int) -> dict:
 
 
 def create_draft(name: str, recipe_ids: list[int]) -> dict:
-    """按顺序引用 2~3 个不同的现有配方；引用不可改，从 20°C 空记录求解。"""
+    """按顺序引用 2~3 个不同的现有**可用**配方；引用不可改，从 20°C 空记录求解。
+
+    停用配方不可被新炉次引用（422，不写入任何炉次）。检查与插入在同一
+    事务内完成，与“停用 / 恢复”按全局锁的某一先后顺序串行生效：停用在先
+    则本炉次创建失败。
+    """
     now = _now()
     with lock(), connect() as conn:
         with _tx(conn):
@@ -304,6 +331,12 @@ def create_draft(name: str, recipe_ids: list[int]) -> dict:
             if missing:
                 raise Unprocessable(
                     f"配方 ID {', '.join(map(str, missing))} 不存在，无法引用。"
+                )
+            inactive = [rid for rid in recipe_ids if not by_id[rid]["active"]]
+            if inactive:
+                raise Unprocessable(
+                    f"配方 ID {', '.join(map(str, inactive))} 已停用，"
+                    "不能用于新建炉次；请恢复后再引用。"
                 )
             ordered = [by_id[r] for r in recipe_ids]
 
